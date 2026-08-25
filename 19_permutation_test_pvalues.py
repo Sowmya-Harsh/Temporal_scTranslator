@@ -19,6 +19,41 @@ Reuses the exact same test-set reconstruction, model loading, and
 inference logic as posthoc_shuffle_tests.py (same seed/config contract),
 just repeats the three shuffle tests many times instead of once.
 
+--- CHANGES IN THIS VERSION (v3) ---
+Three successive bugs were found and fixed in run_inference() across
+earlier revisions of this script:
+
+1. (v1 bug) Time-shuffle originally drew t_src and delta INDEPENDENTLY
+   from Uniform(0, 180) each. This could produce (t_src, delta)
+   combinations that never occur in the real data, and t_tgt values
+   exceeding 180 minutes, outside the dataset's range -- confounding a
+   genuine time-blindness test with plain extrapolation failure.
+
+2. (v2 bug, introduced while fixing #1) Time-shuffle was changed to
+   permute t_info WITHIN each pair's own test set. This is a no-op:
+   within a single timepoint pair, every cell shares the SAME (t_src,
+   delta) value by construction (e.g. every cell in the "0->2" test set
+   has t_src=0, delta=2 -- that is what defines the pair). Permuting a
+   list of identical values leaves it unchanged, which produced a null
+   distribution with zero variance, exactly matching real R, and a
+   p-value of 1.0 -- not evidence that time doesn't matter, but evidence
+   the shuffle wasn't actually changing anything.
+
+3. (this version, v3) Time-shuffle now draws each cell's (t_src, delta)
+   from the POOL of real, observed transitions across ALL TEN pairs, not
+   from within its own pair. Every drawn value is still a genuinely
+   observed transition (never synthetic, never out-of-range), but a
+   cell's RNA/target can now be paired with a *different* pair's real
+   time-conditioning value, producing genuine, meaningful variation.
+
+   Also, both time-shuffle and RNA-shuffle now operate on each pair's
+   FULL test set (55-97 cells), not within 32-cell DataLoader batches,
+   which had understated null variance in earlier runs.
+
+Prediction-shuffle (shuffling the model's own output predictions across
+cells within a pair) was never affected by any of the above and is
+unchanged throughout.
+
 Usage:
     python 19_permutation_test_pvalues.py \
         --rna Final_Dataset/qurie_RNA_clean_aIg.h5ad \
@@ -63,39 +98,82 @@ def within_pair_r(pred, true, min_cells=5):
 
 def run_inference(model, test_ds_by_pair, device, shuffle_time=False,
                    shuffle_rna=False, seed=42):
+    """
+    Run inference on each pair's full test set, optionally shuffling RNA
+    input (within-pair) or time-conditioning input (POOLED ACROSS PAIRS).
+
+    IMPORTANT: within a single timepoint pair's test set, every cell has
+    the SAME (t_src, delta) value by construction (e.g. every cell in the
+    "0->2" test set has t_src=0, delta=2). Permuting t_info WITHIN one
+    pair is therefore a no-op -- it just reorders a list of identical
+    values. To genuinely test whether the model uses time-conditioning,
+    the shuffle must draw from the pool of real (t_src, delta) values
+    observed ACROSS ALL PAIRS, so a cell's RNA/target can be paired with
+    a different, but still genuinely observed, transition's time-
+    conditioning value. RNA-shuffle does not have this issue, since RNA
+    genuinely varies across cells within a pair, so it stays within-pair.
+
+    Both shuffles operate on each pair's full test set (not per-batch),
+    to avoid the earlier micro-batch-scoped shuffling artefact.
+    """
     rng = np.random.default_rng(seed)
     model.eval()
     pred_by_pair, true_by_pair = {}, {}
 
+    # First pass: load every pair's full test set once, and build the pool
+    # of real (t_src, delta) values observed across ALL pairs, for the
+    # time-shuffle draw below.
+    loaded = {}
+    all_t_info = []
     for pair, ds in test_ds_by_pair.items():
         if ds is None or len(ds) == 0:
             continue
-        loader = DataLoader(ds, batch_size=32, shuffle=False)
-        y_hat_all, y_all = [], []
+        loader = DataLoader(ds, batch_size=len(ds), shuffle=False)
+        x_all, y_all, t_info_all = next(iter(loader))
+        loaded[pair] = (x_all, y_all, t_info_all)
+        all_t_info.append(t_info_all)
+
+    if shuffle_time:
+        # Pool of real, observed (t_src, delta) conditioning vectors
+        # across all ten pairs. Every row here is a genuinely observed
+        # transition; no synthetic or out-of-range values are introduced.
+        pooled_t_info = torch.cat(all_t_info, dim=0)
+        n_pool = pooled_t_info.shape[0]
+
+    for pair, (x_all, y_all, t_info_all) in loaded.items():
+        if shuffle_rna:
+            # RNA genuinely varies across cells within a pair, so a
+            # within-pair permutation is meaningful here.
+            perm = torch.from_numpy(rng.permutation(x_all.shape[0]))
+            x_all = x_all[perm]
+
+        if shuffle_time:
+            # Draw, with replacement, from the pool of real (t_src, delta)
+            # values observed across ALL pairs -- one draw per cell in
+            # this pair's test set. Every drawn value is a genuinely
+            # observed transition (possibly from a different pair), so no
+            # synthetic or out-of-range time value is ever supplied, while
+            # still producing genuine, non-trivial variation (unlike a
+            # within-pair permutation, which is a no-op since t_info is
+            # constant within a single pair).
+            draw_idx = rng.integers(0, n_pool, size=x_all.shape[0])
+            t_info_all = pooled_t_info[draw_idx]
+
+        x_all, t_info_all = x_all.to(device), t_info_all.to(device)
         with torch.no_grad():
-            for x, y, t_info in loader:
-                if shuffle_rna:
-                    perm = torch.randperm(x.shape[0])
-                    x = x[perm]
-                if shuffle_time:
-                    fake_t_src = torch.tensor(rng.uniform(0, 180, size=x.shape[0]), dtype=torch.float32)
-                    fake_delta = torch.tensor(rng.uniform(0, 180, size=x.shape[0]), dtype=torch.float32)
-                    t_info = torch.stack([torch.log1p(fake_t_src), torch.log1p(fake_delta)], dim=1)
+            y_hat = model(x_all, t_info_all).cpu().numpy()
 
-                x, t_info = x.to(device), t_info.to(device)
-                y_hat = model(x, t_info).cpu().numpy()
-                y_hat_all.append(y_hat)
-                y_all.append(y.numpy())
-
-        pred_by_pair[pair] = np.concatenate(y_hat_all, axis=0)
-        true_by_pair[pair] = np.concatenate(y_all, axis=0)
+        pred_by_pair[pair] = y_hat
+        true_by_pair[pair] = y_all.numpy()
 
     return pred_by_pair, true_by_pair
 
 
 def permutation_test_prediction_shuffle(pred_real, true_np, real_r, n_permutations, seed):
     """Repeatedly shuffle the model's own predictions across cells (within
-    each pair) and recompute R, n_permutations times."""
+    each pair) and recompute R, n_permutations times. Unaffected by the
+    fixes above: this only reorders the model's own real, already-computed
+    outputs, never draws new synthetic values or re-runs inference."""
     rng = np.random.default_rng(seed)
     null_rs = []
     for _ in range(n_permutations):
@@ -156,7 +234,9 @@ def main():
     os.makedirs(args.outdir, exist_ok=True)
 
     print(f"Reconstructing test sets: gene_strategy={args.gene_strategy} n_genes={n_genes_arg} "
-          f"ot_type={args.ot_type} ot_reg={args.ot_reg} seed={args.seed}")
+          f"ot_type={args.ot_type} ot_reg={args.ot_reg} seed={args.seed} "
+          f"(gene selection computed post-split, train-split cells only, matching "
+          f"train_joint_improved.py's leak-fixed procedure)")
 
     rna_adata = ad.read_h5ad(args.rna)
     prot_adata = ad.read_h5ad(args.protein)
@@ -171,10 +251,24 @@ def main():
     protein_names = list(prot_adata.var_names)
     obs_time = rna_adata.obs["time_min"].values.astype(float)
 
-    gene_idx = select_genes(rna_adata, args.gene_strategy, n_genes_arg, groupby="time_min")
+    # --- Split FIRST, then select genes using ONLY the train-split cells ---
+    # Must match train_joint_improved.py's procedure exactly: gene
+    # selection is computed on the train-split subset only, AFTER
+    # splitting, not on the full population before splitting. Using the
+    # wrong order here reconstructs a different gene panel than the one
+    # the checkpoint was actually trained on, silently feeding the model
+    # RNA features in the wrong identity/order and producing a spuriously
+    # low R that reflects a data-reconstruction mismatch, not genuine
+    # model performance.
+    train_cells, val_cells, test_cells = split_cells_per_timepoint(obs_time, seed=args.seed)
+
+    train_idx_all = np.concatenate([idx for idx in train_cells.values() if len(idx) > 0])
+    rna_adata_train = rna_adata[train_idx_all].copy()
+    gene_idx = select_genes(rna_adata_train, args.gene_strategy, n_genes_arg, groupby="time_min")
+    print(f"Selected {len(gene_idx)} genes via {args.gene_strategy} "
+          f"(train-split cells only: {len(train_idx_all)}/{rna_adata.n_obs}).")
     rna_selected = rna_full[:, gene_idx]
 
-    train_cells, val_cells, test_cells = split_cells_per_timepoint(obs_time, seed=args.seed)
     available_pairs = [(s, t) for s, t in CURRICULUM if s in train_cells and t in train_cells]
 
     test_ds_by_pair = {}
@@ -209,6 +303,9 @@ def main():
     }
 
     print(f"\n=== PERMUTATION TEST 2: TIME SHUFFLE ({args.n_permutations} permutations, slower) ===")
+    print("(Drawing REAL observed (t_src, delta) pairs from the POOL across all timepoint "
+          "pairs -- within-pair permutation is a no-op since t_info is constant within a "
+          "single pair. No synthetic or out-of-range values are used.)")
     null_rs_time, p_time = permutation_test_inference_shuffle(
         model, test_ds_by_pair, device, true_np, real_r,
         args.n_permutations, shuffle_time=True, shuffle_rna=False, base_seed=args.seed * 1000)
@@ -221,6 +318,7 @@ def main():
     }
 
     print(f"\n=== PERMUTATION TEST 3: RNA SHUFFLE ({args.n_permutations} permutations, slower) ===")
+    print("(Shuffling RNA across cells within each pair's full test set, not per-batch.)")
     null_rs_rna, p_rna = permutation_test_inference_shuffle(
         model, test_ds_by_pair, device, true_np, real_r,
         args.n_permutations, shuffle_time=False, shuffle_rna=True, base_seed=args.seed * 2000)

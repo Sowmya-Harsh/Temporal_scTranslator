@@ -231,7 +231,13 @@ def main(args):
     # match what the checkpoint was actually trained on.
     print(f"Loading pretrained checkpoint from {args.checkpoint} (architecture: {args.model})...")
     ckpt = torch.load(args.checkpoint, map_location="cpu")
-    trunk_input_dim = ckpt.get("trunk_input_dim", 1000)  # matches thesis's 1000-gene DEG panel
+    # trunk_input_dim = ckpt.get("trunk_input_dim", 1000)  # matches thesis's 1000-gene DEG panel
+    # Prefer the checkpoint's own saved value if present (most reliable),
+    # but fall back to args.gene_panel_size (which you set explicitly on
+    # the command line) rather than a hardcoded 1000 -- silently defaulting
+    # to 1000 here caused a shape mismatch when loading non-1000-gene
+    # checkpoints (e.g. the DEG-200/DEG-500 panel-size sweep checkpoints).
+    trunk_input_dim = ckpt.get("trunk_input_dim", args.gene_panel_size)
     trunk_output_dim = ckpt.get("trunk_output_dim", 58)  # matches thesis's 58-protein panel
     trunk = build_model(args.model, n_genes=trunk_input_dim, n_proteins=trunk_output_dim)
     state_dict_key = "model_state_dict" if "model_state_dict" in ckpt else "state_dict"

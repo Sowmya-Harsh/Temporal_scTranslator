@@ -46,7 +46,13 @@ def main(run_dir, run_dirs_multi, pairs_arg, proteins, out_path):
     # than averaging a scalar, since a scatter plot needs actual points, not
     # a summary statistic. Each point retains which fold it came from, so it
     # can be colour-coded rather than pooled into one indistinguishable blob.
-    pooled = {p: {"true": [], "pred": [], "fold": []} for p in proteins}
+    # IMPORTANT: points ALSO retain which (t_src, t_tgt) pair they came from,
+    # used below to compute R correctly (per pair, then averaged) rather
+    # than on the concatenated pool -- concatenating pairs before computing
+    # one correlation reproduces the exact pooled-metric artefact this
+    # thesis documents (Table pooled-artefact), just with "pair" playing
+    # the role "protein" played there.
+    pooled = {p: {"true": [], "pred": [], "fold": [], "pair": []} for p in proteins}
 
     for rd in run_dirs:
         rd = Path(rd)
@@ -65,6 +71,7 @@ def main(run_dir, run_dirs_multi, pairs_arg, proteins, out_path):
                 pooled[p]["true"].extend(y_true[p].values)
                 pooled[p]["pred"].extend(y_pred[p].values)
                 pooled[p]["fold"].extend([rd.name] * len(y_true))
+                pooled[p]["pair"].extend([f"{t_src}:{t_tgt}"] * len(y_true))
 
     n = len(proteins)
     ncols = 3
@@ -93,9 +100,23 @@ def main(run_dir, run_dirs_multi, pairs_arg, proteins, out_path):
         lims = [min(yt.min(), yp.min()), max(yt.max(), yp.max())]
         ax.plot(lims, lims, color="black", linestyle="--", linewidth=1, label="y = x")
 
-        if np.std(yt) > 1e-8 and np.std(yp) > 1e-8:
-            r, _ = pearsonr(yt, yp)
-            ax.set_title(f"{p} (R = {r:.3f}, n = {len(yt)})", color="black")
+        # CORRECT R: computed separately within each (t_src,t_tgt) pair,
+        # then averaged across pairs -- matches the thesis's per-protein-
+        # averaged convention (Table final-per-pair). NEVER computed on
+        # the concatenated/pooled points above, even though those same
+        # points are what's drawn on the scatter -- visualizing pooled
+        # points is fine, reporting one correlation across them is not.
+        pair_labels = np.array(pooled[p]["pair"])
+        per_pair_r = []
+        for pair_label in sorted(set(pair_labels)):
+            mask = pair_labels == pair_label
+            yt_pair, yp_pair = yt[mask], yp[mask]
+            if np.std(yt_pair) > 1e-8 and np.std(yp_pair) > 1e-8:
+                r_pair, _ = pearsonr(yt_pair, yp_pair)
+                per_pair_r.append(r_pair)
+        if per_pair_r:
+            r = float(np.mean(per_pair_r))
+            ax.set_title(f"{p} (mean per-pair R = {r:.3f}, n = {len(yt)})", color="black")
         else:
             ax.set_title(f"{p} (n = {len(yt)})", color="black")
 
@@ -113,7 +134,8 @@ def main(run_dir, run_dirs_multi, pairs_arg, proteins, out_path):
     for j in range(n, len(axes)):
         axes[j].axis("off")
 
-    title_suffix = f"pooled across {len(run_dirs)} fold(s) x shown pairs" if run_dirs_multi else "pooled across shown pairs"
+    title_suffix = f"points pooled across {len(run_dirs)} fold(s) x shown pairs, R = mean per-pair" if run_dirs_multi \
+        else "points pooled across shown pairs, R = mean per-pair"
     fig.suptitle(f"Predicted vs.\ true protein abundance, selected proteins ({title_suffix})",
                  color="black", fontsize=13)
     fig.tight_layout()

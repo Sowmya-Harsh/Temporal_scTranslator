@@ -145,39 +145,135 @@ def get_ot_targets(rna_src, rna_tgt, prot_tgt, ot_type, reg, max_genes=2000):
 
 
 def build_pair_dataset(rna_selected, prot_full, train_cells, val_cells, test_cells,
-                        t_src, t_tgt, ot_type, ot_reg, shuffle_rna=False, shuffle_time=False, seed=1105):
-    """Build train/val/test PairDataset for one (t_src,t_tgt) transition."""
+                       t_src, t_tgt, ot_type, ot_reg, shuffle_rna=False,
+                       shuffle_time=False, seed=1105):
+    """Build train/test PairDataset for one (t_src,t_tgt) transition.
+
+    If val_cells is provided, also builds a validation dataset.
+    If val_cells is None, only train and test datasets are built.
+    """
+
     if t_src not in train_cells or t_tgt not in train_cells:
         print(f"  SKIP {t_src}->{t_tgt}: timepoint not in data.")
         return None, None, None
 
-    train_src, train_tgt = train_cells[t_src], train_cells[t_tgt]
-    val_src, test_src = val_cells[t_src], test_cells[t_src]
+    train_src = train_cells[t_src]
+    train_tgt = train_cells[t_tgt]
+
+    test_src = test_cells[t_src]
+
+    # Validation is optional.
+    if val_cells is not None:
+        val_src = val_cells[t_src]
+    else:
+        val_src = None
+
     if len(train_src) < 2 or len(train_tgt) < 2:
         print(f"  SKIP {t_src}->{t_tgt}: too few cells.")
         return None, None, None
 
-    print(f"  Building {t_src}->{t_tgt}: train_src={len(train_src)} train_tgt={len(train_tgt)}")
-    train_targets = get_ot_targets(rna_selected[train_src], rna_selected[train_tgt],
-                                    prot_full[train_tgt], ot_type, ot_reg)
-    val_targets = get_ot_targets(rna_selected[val_src], rna_selected[train_tgt],
-                                  prot_full[train_tgt], ot_type, ot_reg) if len(val_src) > 1 else None
-    test_targets = get_ot_targets(rna_selected[test_src], rna_selected[train_tgt],
-                                   prot_full[train_tgt], ot_type, ot_reg) if len(test_src) > 1 else None
+    print(
+        f"  Building {t_src}->{t_tgt}: "
+        f"train_src={len(train_src)} "
+        f"train_tgt={len(train_tgt)}"
+        + (
+            f" val_src={len(val_src)}"
+            if val_src is not None
+            else ""
+        )
+        + f" test_src={len(test_src)}"
+    )
 
-    # shuffle_rna: CONTROL, applied ONLY to training data -- permutes which
-    # RNA vector goes with which target, targets unchanged. Val/test stay
-    # real, so we can still measure whether "learning" transfers to real data.
+    # ---------------------------------------------------------
+    # Training OT targets
+    # ---------------------------------------------------------
+    train_targets = get_ot_targets(
+        rna_selected[train_src],
+        rna_selected[train_tgt],
+        prot_full[train_tgt],
+        ot_type,
+        ot_reg
+    )
+
+    # ---------------------------------------------------------
+    # Validation OT targets -- only if validation exists
+    # ---------------------------------------------------------
+    if val_src is not None and len(val_src) > 1:
+        val_targets = get_ot_targets(
+            rna_selected[val_src],
+            rna_selected[train_tgt],
+            prot_full[train_tgt],
+            ot_type,
+            ot_reg
+        )
+    else:
+        val_targets = None
+
+    # ---------------------------------------------------------
+    # Test OT targets
+    # ---------------------------------------------------------
+    test_targets = (
+        get_ot_targets(
+            rna_selected[test_src],
+            rna_selected[train_tgt],
+            prot_full[train_tgt],
+            ot_type,
+            ot_reg
+        )
+        if len(test_src) > 1
+        else None
+    )
+
+    # ---------------------------------------------------------
+    # Training RNA
+    # ---------------------------------------------------------
+    # shuffle_rna is a control applied ONLY to training data.
+    # Targets remain unchanged.
+    # Validation/test data remain untouched.
     train_rna = rna_selected[train_src]
+
     if shuffle_rna:
         rng = np.random.default_rng(seed)
         perm = rng.permutation(len(train_rna))
         train_rna = train_rna[perm]
-        print(f"    *** shuffle_rna applied to {t_src}->{t_tgt} training data ***")
 
-    train_ds = PairDataset(train_rna, train_targets, t_src, t_tgt, shuffle_time=shuffle_time, seed=seed)
-    val_ds = PairDataset(rna_selected[val_src], val_targets, t_src, t_tgt) if val_targets is not None else None
-    test_ds = PairDataset(rna_selected[test_src], test_targets, t_src, t_tgt) if test_targets is not None else None
+        print(
+            f"    *** shuffle_rna applied to "
+            f"{t_src}->{t_tgt} training data ***"
+        )
+
+    # ---------------------------------------------------------
+    # Construct datasets
+    # ---------------------------------------------------------
+    train_ds = PairDataset(
+        train_rna,
+        train_targets,
+        t_src,
+        t_tgt,
+        shuffle_time=shuffle_time,
+        seed=seed
+    )
+
+    if val_targets is not None:
+        val_ds = PairDataset(
+            rna_selected[val_src],
+            val_targets,
+            t_src,
+            t_tgt
+        )
+    else:
+        val_ds = None
+
+    if test_targets is not None:
+        test_ds = PairDataset(
+            rna_selected[test_src],
+            test_targets,
+            t_src,
+            t_tgt
+        )
+    else:
+        test_ds = None
+
     return train_ds, val_ds, test_ds
 
 
@@ -320,11 +416,18 @@ def main():
     protein_names = list(prot_adata.var_names)
     obs_time = rna_adata.obs["time_min"].values.astype(float)
 
-    gene_idx = select_genes(rna_adata, args.gene_strategy, n_genes_arg, groupby="time_min")
-    print(f"Selected {len(gene_idx)} genes via {args.gene_strategy}.")
+    # --- Split FIRST, then select genes using ONLY the train-split cells ---
+    # (previously gene selection ran on the full population before this split,
+    # so val/test cells' RNA leaked into which genes got chosen)
+    train_cells, val_cells, test_cells = split_cells_per_timepoint(obs_time, seed=args.seed)
+
+    train_idx_all = np.concatenate([idx for idx in train_cells.values() if len(idx) > 0])
+    rna_adata_train = rna_adata[train_idx_all].copy()
+    gene_idx = select_genes(rna_adata_train, args.gene_strategy, n_genes_arg, groupby="time_min")
+    print(f"Selected {len(gene_idx)} genes via {args.gene_strategy} "
+          f"(train-split cells only: {len(train_idx_all)}/{rna_adata.n_obs}).")
     rna_selected = rna_full[:, gene_idx]
 
-    train_cells, val_cells, test_cells = split_cells_per_timepoint(obs_time, seed=args.seed)
     available_pairs = [(s, t) for s, t in CURRICULUM if s in train_cells and t in train_cells]
     print(f"Available timepoint pairs in this data: {available_pairs}")
 
@@ -426,28 +529,53 @@ def main():
                     print(f"    Stage {stage_i} epoch {e:>3} (global {global_epoch}): "
                           f"train_loss={train_loss:.4f} val_loss={val_loss:.4f}{flag}")
 
-    # --- Load best checkpoint, evaluate the ONE model on every pair's test set ---
+    # --- Load best checkpoint, evaluate the ONE model on val AND test sets ---
     print(f"\nLoading best checkpoint (val_loss={best_val_loss:.4f}) for final evaluation...")
     ckpt = torch.load(ckpt_path, map_location=device)
     model.load_state_dict(ckpt["model_state_dict"])
 
-    print("\n=== FINAL: single joint model evaluated per timepoint pair ===")
+    print("\n=== FINAL: single joint model evaluated per timepoint pair (VALIDATION) ===")
+    val_pair_results = evaluate_per_pair(model, val_ds_by_pair, device, protein_names, outdir=None)
+
+    print("\n=== FINAL: single joint model evaluated per timepoint pair (TEST) ===")
     per_pair_results = evaluate_per_pair(model, test_ds_by_pair, device, protein_names, outdir=args.outdir)
 
-    # --- Save ---
+    # --- Save: one row per (split, t_src, t_tgt), so val and test sit side
+    # by side in the same file. Model/config selection across a sweep should
+    # be done using the 'val' rows only -- the 'test' rows exist purely for
+    # final reporting once a config is already chosen on validation. ---
     summary_path = os.path.join(args.outdir, "joint_results_summary.csv")
     with open(summary_path, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["t_src", "t_tgt", "n_test", "mse", "mean_pearson_r", "ccc"])
+        writer.writerow(["split", "t_src", "t_tgt", "n", "mse", "mean_pearson_r", "ccc"])
+        for (t_src, t_tgt), res in val_pair_results.items():
+            writer.writerow(["val", t_src, t_tgt, res["n_test"], res["mse"], res["mean_pearson_r"], res["ccc"]])
         for (t_src, t_tgt), res in per_pair_results.items():
-            writer.writerow([t_src, t_tgt, res["n_test"], res["mse"], res["mean_pearson_r"], res["ccc"]])
+            writer.writerow(["test", t_src, t_tgt, res["n_test"], res["mse"], res["mean_pearson_r"], res["ccc"]])
+
+    # --- Pooled scalars (mean across pairs) for quick cross-config comparison
+    # during sweeps -- this is the number a config-selection script should
+    # read, using the val_* fields only, never the test_* fields. ---
+    def _pool(results_dict, key):
+        vals = [r[key] for r in results_dict.values() if not np.isnan(r[key])]
+        return float(np.mean(vals)) if vals else float("nan")
+
+    val_mean_r = _pool(val_pair_results, "mean_pearson_r")
+    val_mean_ccc = _pool(val_pair_results, "ccc")
+    test_mean_r = _pool(per_pair_results, "mean_pearson_r")
+    test_mean_ccc = _pool(per_pair_results, "ccc")
+    print(f"\nPooled (mean over pairs): val_R={val_mean_r:.4f} val_CCC={val_mean_ccc:.4f} "
+          f"| test_R={test_mean_r:.4f} test_CCC={test_mean_ccc:.4f}")
 
     with open(os.path.join(args.outdir, "joint_config.json"), "w") as f:
         json.dump({"config": vars(args), "n_genes_actual": len(gene_idx),
                     "best_val_loss": best_val_loss, "checkpoint_path": ckpt_path,
-                    "available_pairs": available_pairs}, f, indent=2)
+                    "available_pairs": available_pairs,
+                    "val_mean_pearson_r": val_mean_r, "val_mean_ccc": val_mean_ccc,
+                    "test_mean_pearson_r": test_mean_r, "test_mean_ccc": test_mean_ccc},
+                  f, indent=2)
 
-    print(f"\nSaved per-pair results to {summary_path}")
+    print(f"\nSaved per-pair val+test results to {summary_path}")
     print(f"Saved single joint model checkpoint to {ckpt_path}")
 
 
