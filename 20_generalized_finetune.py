@@ -99,12 +99,33 @@ def per_protein_r(y_true, y_pred):
     rs = []
     for p in range(y_true.shape[1]):
         yt, yp = y_true[:, p], y_pred[:, p]
-        if np.std(yt) < 1e-8 or np.std(yp) < 1e-8:
+        if np.std(yt) < 1e-8:
+            continue  # no real signal in this channel's truth
+        if np.std(yp) < 1e-8:
+            rs.append(0.0)  # constant predictor -> no correlation, not NaN
             continue
         r, _ = pearsonr(yt, yp)
         if not np.isnan(r):
             rs.append(r)
     return float(np.mean(rs)) if rs else float("nan")
+
+
+def per_protein_ccc(y_true, y_pred):
+    """Matches the convention used everywhere else in this pipeline
+    (train_joint.py, 14_baselines.py) -- was previously MISSING here
+    despite the module docstring claiming CCC was computed. This gap
+    meant Table myeloid-multiseed's CCC column had no script behind it."""
+    cccs = []
+    for p in range(y_true.shape[1]):
+        yt, yp = y_true[:, p], y_pred[:, p]
+        if np.std(yt) < 1e-8:
+            continue
+        mean_t, mean_p = np.mean(yt), np.mean(yp)
+        var_t, var_p = np.var(yt), np.var(yp)
+        cov = np.mean((yt - mean_t) * (yp - mean_p))
+        ccc = (2 * cov) / (var_t + var_p + (mean_t - mean_p) ** 2 + 1e-12)
+        cccs.append(ccc)
+    return float(np.mean(cccs)) if cccs else float("nan")
 
 
 def compute_ot_targets(rna_src, rna_tgt, prot_tgt, reg=0.01, max_genes=2000):
@@ -194,6 +215,56 @@ class FiLMPreTrunk(nn.Module):
         return torch.sigmoid(self.out(h))
 
 
+class GatedTimeInjectionExternal(nn.Module):
+    """Exact copy of models.py's GatedTimeInjection -- module names
+    (shift, gate) and init (gate bias=-2.0) must match exactly for the
+    gated checkpoint's state_dict to load correctly."""
+    def __init__(self, n_genes, t_dim=2, hidden=64):
+        super().__init__()
+        self.shift = nn.Sequential(
+            nn.Linear(t_dim, hidden), nn.SiLU(),
+            nn.Linear(hidden, hidden), nn.SiLU(),
+            nn.Linear(hidden, n_genes),
+        )
+        self.gate = nn.Sequential(
+            nn.Linear(t_dim, n_genes),
+            nn.Sigmoid(),
+        )
+        nn.init.zeros_(self.gate[0].weight)
+        nn.init.constant_(self.gate[0].bias, -2.0)
+
+    def forward(self, x, t_info):
+        shift = self.shift(t_info)
+        gate = self.gate(t_info)
+        return x + gate * shift
+
+
+class GatedTrunk(nn.Module):
+    """Reconstructs models.py's GatedInjectionMLP (gated_in -> trunk -> out)
+    for loading the new final-model checkpoint (gated architecture,
+    DEG-3000, combined correlation+CCC loss). Module names must match
+    GatedInjectionMLP exactly so the checkpoint's state_dict loads
+    without remapping."""
+
+    def __init__(self, trunk_input_dim, trunk_output_dim, hidden_dims=(512, 256, 128),
+                 dropout=0.2, t_dim=2):
+        super().__init__()
+        self.gated_in = GatedTimeInjectionExternal(trunk_input_dim, t_dim=t_dim)
+        dims = [trunk_input_dim] + list(hidden_dims)
+        layers = []
+        for i in range(len(dims) - 1):
+            layers += [nn.Linear(dims[i], dims[i + 1]), nn.ReLU(), nn.Dropout(dropout)]
+        self.trunk = nn.Sequential(*layers)
+        self.out = nn.Linear(dims[-1], trunk_output_dim)
+        self.trunk_input_dim = trunk_input_dim
+        self.trunk_output_dim = trunk_output_dim
+
+    def forward(self, x, t_info):
+        x_mod = self.gated_in(x, t_info)
+        h = self.trunk(x_mod)
+        return torch.sigmoid(self.out(h))
+
+
 class AdaptedModel(nn.Module):
     """Pretrained trunk + new linear adapters so it can consume/produce
     the NEW dataset's own gene/protein panel sizes, whatever they are."""
@@ -244,8 +315,30 @@ def main(args):
         raise ValueError(f"Need >= 2 distinct timepoints in {args.time_col}, found {times}")
     print(f"Detected timepoints: {times}")
 
-    print(f"Selecting top {args.gene_panel_size} DEG genes on external data...")
-    deg_genes = select_deg_genes(rna, args.time_col, args.gene_panel_size)
+    # --- Split ONCE, here, before anything touches gene selection or OT ---
+    # (previously select_deg_genes ran on the full `rna` before any split
+    # existed, so val/test cells' RNA leaked into which genes got chosen).
+    # This single split is reused below for gene selection, OT target pools,
+    # and train/val/test dataset construction -- no second split is computed
+    # later, so there is no risk of the two silently diverging.
+    time_masks = {t: np.where(np.isclose(rna.obs[args.time_col].values.astype(float), t))[0]
+                  for t in times}
+    rng = np.random.default_rng(args.seed)
+    train_masks, val_masks, test_masks = {}, {}, {}
+    for t in times:
+        idx = time_masks[t].copy()
+        rng.shuffle(idx)
+        n_tr = int(0.8 * len(idx))
+        n_va = int(0.1 * len(idx))
+        train_masks[t] = idx[:n_tr]
+        val_masks[t] = idx[n_tr:n_tr + n_va]
+        test_masks[t] = idx[n_tr + n_va:]
+
+    train_idx_all = np.concatenate([train_masks[t] for t in times if len(train_masks[t]) > 0])
+    print(f"Selecting top {args.gene_panel_size} DEG genes on external data "
+          f"(train-split cells only: {len(train_idx_all)}/{rna.n_obs})...")
+    rna_train_for_genes = rna[train_idx_all].copy()
+    deg_genes = select_deg_genes(rna_train_for_genes, args.time_col, args.gene_panel_size)
     deg_genes = [g for g in deg_genes if g in rna.var_names]
     print(f"  {len(deg_genes)} genes selected (after intersecting with var_names)")
 
@@ -261,11 +354,31 @@ def main(args):
     # Load pretrained trunk
     print(f"Loading pretrained checkpoint from {args.checkpoint}...")
     ckpt = torch.load(args.checkpoint, map_location="cpu")
-    trunk_input_dim = ckpt.get("trunk_input_dim", 1000)  # matches thesis's 1000-gene DEG panel
-    trunk_output_dim = ckpt.get("trunk_output_dim", 58)  # matches thesis's 58-protein panel
-    trunk = FiLMPreTrunk(trunk_input_dim, trunk_output_dim)
     state_dict_key = "model_state_dict" if "model_state_dict" in ckpt else "state_dict"
-    missing, unexpected = trunk.load_state_dict(ckpt[state_dict_key], strict=False)
+    sd = ckpt[state_dict_key]
+
+    # Infer trunk_input_dim/trunk_output_dim directly from the checkpoint's
+    # own tensor shapes -- NEVER trust ckpt.get("trunk_input_dim", 1000),
+    # since train_joint_improved.py's saved checkpoints never actually
+    # contain that key (only epoch/model_state_dict/optimizer_state_dict/
+    # val_loss), so that .get() call always silently fell back to the
+    # hardcoded default of 1000 regardless of the real training config.
+    # This worked by coincidence for the original DEG-1000 checkpoint and
+    # broke silently/loudly for any other panel size (e.g. DEG-3000).
+    # trunk.0 is always the first Linear layer of the shared trunk
+    # (nn.Linear(trunk_input_dim, 512, ...)) in BOTH FiLMPreTrunk and
+    # GatedTrunk, so its second dimension is trunk_input_dim regardless
+    # of architecture -- this is simpler and correct for both, unlike
+    # inferring from the architecture-specific conditioning module.
+    trunk_input_dim = sd["trunk.0.weight"].shape[1]
+    trunk_output_dim = sd["out.weight"].shape[0]
+    print(f"Inferred trunk dims from checkpoint: input={trunk_input_dim} output={trunk_output_dim}")
+
+    if args.model == "gated":
+        trunk = GatedTrunk(trunk_input_dim, trunk_output_dim)
+    else:
+        trunk = FiLMPreTrunk(trunk_input_dim, trunk_output_dim)
+    missing, unexpected = trunk.load_state_dict(sd, strict=False)
     if missing or unexpected:
         print(f"  WARNING: state_dict mismatch — missing={missing}, unexpected={unexpected}. "
               f"Check FiLMPreTrunk architecture matches your real checkpoint's saved class exactly.")
@@ -277,22 +390,10 @@ def main(args):
         {"params": model.trunk.parameters(), "lr": args.lr_trunk},
     ])
 
-    # Build all pairwise timepoint transitions from whatever timepoints exist
+    # Build all pairwise timepoint transitions from whatever timepoints exist.
+    # (train_masks/val_masks/test_masks/time_masks/rng were already built
+    # above, before gene selection -- reused here as-is, not recomputed.)
     pairs = [(t1, t2) for i, t1 in enumerate(times) for t2 in times[i + 1:]]
-    rng = np.random.default_rng(args.seed)
-    time_masks = {t: np.where(np.isclose(rna.obs[args.time_col].values.astype(float), t))[0] for t in times}
-
-    # Split EACH timepoint's cells into train/val/test independently first
-    # (Section 4.9 protocol), so we can restrict OT target pools correctly.
-    train_masks, val_masks, test_masks = {}, {}, {}
-    for t in times:
-        idx = time_masks[t]
-        rng.shuffle(idx)
-        n_tr = int(0.8 * len(idx))
-        n_va = int(0.1 * len(idx))
-        train_masks[t] = idx[:n_tr]
-        val_masks[t] = idx[n_tr:n_tr + n_va]
-        test_masks[t] = idx[n_tr + n_va:]
 
     train_pairs, val_pairs, test_pairs = [], [], []
     for t_src, t_tgt in pairs:
@@ -345,6 +446,21 @@ def main(args):
                 pair_rs.append(r)
         return float(np.mean(pair_rs)) if pair_rs else float("nan")
 
+    def per_pair_ccc(y_true, y_pred, pair_ids):
+        """Same convention as per_pair_r above, but CCC. Was previously
+        entirely missing from this script -- Table myeloid-multiseed's
+        CCC column had no computation behind it before this fix."""
+        unique_pairs = sorted(set(pair_ids))
+        pair_cccs = []
+        for pair in unique_pairs:
+            mask = np.array([pid == pair for pid in pair_ids])
+            if mask.sum() < 5:
+                continue
+            ccc = per_protein_ccc(y_true[mask], y_pred[mask])
+            if not np.isnan(ccc):
+                pair_cccs.append(ccc)
+        return float(np.mean(pair_cccs)) if pair_cccs else float("nan")
+
     x_tr, t_tr, y_tr, pairs_tr = batch_tensors_with_pairs(train_pairs)
     x_va, t_va, y_va, pairs_va = batch_tensors_with_pairs(val_pairs)
     x_te, t_te, y_te, pairs_te = batch_tensors_with_pairs(test_pairs)
@@ -374,6 +490,7 @@ def main(args):
     with torch.no_grad():
         test_pred = model(x_te, t_te).numpy()
     test_r = per_pair_r(y_te.numpy(), test_pred, pairs_te)
+    test_ccc = per_pair_ccc(y_te.numpy(), test_pred, pairs_te)
 
     # Shuffle diagnostics (Section 4.8), computed per-pair then averaged --
     # matches posthoc_shuffle_tests.py convention, not pooled across pairs.
@@ -388,16 +505,19 @@ def main(args):
         perm = rng2.permutation(idxs)
         shuffled_pred[idxs] = test_pred[perm]
     r_pred_shuffle = per_pair_r(y_te.numpy(), shuffled_pred, pairs_te)
+    ccc_pred_shuffle = per_pair_ccc(y_te.numpy(), shuffled_pred, pairs_te)
 
     t_te_shuffled = t_te[torch.randperm(len(t_te))]
     with torch.no_grad():
         pred_time_shuffle = model(x_te, t_te_shuffled).numpy()
     r_time_shuffle = per_pair_r(y_te.numpy(), pred_time_shuffle, pairs_te)
+    ccc_time_shuffle = per_pair_ccc(y_te.numpy(), pred_time_shuffle, pairs_te)
 
     x_te_shuffled = x_te[torch.randperm(len(x_te))]
     with torch.no_grad():
         pred_rna_shuffle = model(x_te_shuffled, t_te).numpy()
     r_rna_shuffle = per_pair_r(y_te.numpy(), pred_rna_shuffle, pairs_te)
+    ccc_rna_shuffle = per_pair_ccc(y_te.numpy(), pred_rna_shuffle, pairs_te)
 
     per_pair_breakdown = {}
     for pair in sorted(set(pairs_te)):
@@ -405,7 +525,8 @@ def main(args):
         if mask.sum() < 5:
             continue
         r = per_protein_r(y_te.numpy()[mask], test_pred[mask])
-        per_pair_breakdown[f"{pair[0]}->{pair[1]}"] = {"n_test": int(mask.sum()), "R": r}
+        ccc = per_protein_ccc(y_te.numpy()[mask], test_pred[mask])
+        per_pair_breakdown[f"{pair[0]}->{pair[1]}"] = {"n_test": int(mask.sum()), "R": r, "CCC": ccc}
 
     # Save per-pair pred/truth CSVs in the SAME format as the main pipeline
     # (joint_y_pred_t{src}to{tgt}.csv / joint_y_truth_t{src}to{tgt}.csv,
@@ -439,18 +560,20 @@ def main(args):
         "n_genes_selected": len(deg_genes),
         "n_proteins": new_output_dim,
         "test_R": test_r,
+        "test_CCC": test_ccc,
         "per_pair_breakdown": per_pair_breakdown,
         "diagnostics": {
-            "real_R": test_r,
-            "prediction_shuffle_R": r_pred_shuffle,
-            "time_shuffle_R": r_time_shuffle,
-            "rna_shuffle_R": r_rna_shuffle,
+            "real_R": test_r, "real_CCC": test_ccc,
+            "prediction_shuffle_R": r_pred_shuffle, "prediction_shuffle_CCC": ccc_pred_shuffle,
+            "time_shuffle_R": r_time_shuffle, "time_shuffle_CCC": ccc_time_shuffle,
+            "rna_shuffle_R": r_rna_shuffle, "rna_shuffle_CCC": ccc_rna_shuffle,
         },
     }
     with open(out_dir / "results.json", "w") as f:
         json.dump(results, f, indent=2)
-    print(f"\nFinal test R = {test_r:.4f}")
-    print(f"Diagnostics: pred-shuffle R={r_pred_shuffle:.4f} | time-shuffle R={r_time_shuffle:.4f} | rna-shuffle R={r_rna_shuffle:.4f}")
+    print(f"\nFinal test R = {test_r:.4f} | Final test CCC = {test_ccc:.4f}")
+    print(f"Diagnostics R:   pred-shuffle={r_pred_shuffle:.4f} | time-shuffle={r_time_shuffle:.4f} | rna-shuffle={r_rna_shuffle:.4f}")
+    print(f"Diagnostics CCC: pred-shuffle={ccc_pred_shuffle:.4f} | time-shuffle={ccc_time_shuffle:.4f} | rna-shuffle={ccc_rna_shuffle:.4f}")
     print(f"Saved results to {out_dir}/results.json")
 
 
@@ -462,6 +585,11 @@ if __name__ == "__main__":
     parser.add_argument("--gene_id_col", type=str, default=None,
                          help="var column holding gene symbols, if not already var_names")
     parser.add_argument("--checkpoint", type=str, required=True)
+    parser.add_argument("--model", type=str, default="film_pre", choices=["film_pre", "gated"],
+                         help="Trunk architecture matching the checkpoint being loaded. "
+                              "Defaults to film_pre for backward compatibility with the "
+                              "original correlation-only/DEG-1000 checkpoint; use 'gated' "
+                              "for the new gated/DEG-3000/combined-loss final model.")
     parser.add_argument("--gene_panel_size", type=int, default=1000)
     parser.add_argument("--ot_reg", type=float, default=0.01)
     parser.add_argument("--epochs", type=int, default=30)

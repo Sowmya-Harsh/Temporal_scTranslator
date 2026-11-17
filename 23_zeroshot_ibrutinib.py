@@ -25,6 +25,7 @@ Usage:
         --outdir results/zeroshot_gated_ibrutinib
 """
 import argparse
+from html import parser
 import os
 import sys
 
@@ -86,9 +87,12 @@ def main():
     parser.add_argument("--ot_type", choices=["soft", "hard", "hard_assignment"], required=True)
     parser.add_argument("--ot_reg", type=float, default=0.01)
     parser.add_argument("--model", choices=["mlp", "film_pre", "film_post", "gated", "gated_post"], required=True)
+    parser.add_argument("--time_embed", choices=["raw", "sinusoidal"], default="raw",
+                     help="MUST match the time_embed used to train the checkpoint being loaded.")
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--seed", type=int, default=1105)
     parser.add_argument("--outdir", required=True)
+    
     args = parser.parse_args()
 
     n_genes_arg = args.n_genes if args.n_genes == "all" else int(args.n_genes)
@@ -131,7 +135,8 @@ def main():
 
     ds = PairDataset(rna_selected[src_idx], targets, t_src, t_tgt)
 
-    model = build_model(args.model, n_genes=len(common_genes), n_proteins=len(protein_names)).to(device)
+    model = build_model(args.model, n_genes=len(common_genes), n_proteins=len(protein_names),
+                     time_embed=args.time_embed).to(device)
     ckpt = torch.load(args.checkpoint, map_location=device)
     model.load_state_dict(ckpt["model_state_dict"])
     print(f"Loaded checkpoint (epoch={ckpt.get('epoch', '?')})")

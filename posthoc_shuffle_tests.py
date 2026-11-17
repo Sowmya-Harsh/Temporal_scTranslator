@@ -132,10 +132,13 @@ def main():
     protein_names = list(prot_adata.var_names)
     obs_time = rna_adata.obs["time_min"].values.astype(float)
 
-    gene_idx = select_genes(rna_adata, args.gene_strategy, n_genes_arg, groupby="time_min")
+    train_cells, val_cells, test_cells = split_cells_per_timepoint(obs_time, seed=args.seed)
+    train_idx_all = np.concatenate([idx for idx in train_cells.values() if len(idx) > 0])
+    rna_adata_train = rna_adata[train_idx_all].copy()
+    gene_idx = select_genes(rna_adata_train, args.gene_strategy, n_genes_arg, groupby="time_min")
+    print(f"Selected {len(gene_idx)} genes (train-split cells only: {len(train_idx_all)}/{rna_adata.n_obs}).")
     rna_selected = rna_full[:, gene_idx]
 
-    train_cells, val_cells, test_cells = split_cells_per_timepoint(obs_time, seed=args.seed)
     available_pairs = [(s, t) for s, t in CURRICULUM if s in train_cells and t in train_cells]
 
     test_ds_by_pair = {}
